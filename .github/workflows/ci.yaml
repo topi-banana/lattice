@@ -1,0 +1,161 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 同じ ref に対する古い実行はキャンセルする。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # スペルチェック・未使用依存チェック・フォーマットチェック。
+  lint:
+    name: typos / cargo-machete / fmt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: typos,cargo-machete
+
+      - name: Run typos
+        run: typos
+
+      - name: Run cargo-machete
+        run: cargo machete
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Run cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  # [win, mac, linux] x [amd64, arm64] + no-std + wasm の各プラットフォームで
+  # clippy / nextest / build を実行する。
+  platforms:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # [win, mac, linux] x [amd64, arm64]: ホスト上で全コマンドを実行。
+          - name: linux-amd64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            all_targets: true
+            tests: true
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            all_targets: true
+            tests: true
+          - name: windows-amd64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            all_targets: true
+            tests: true
+          - name: windows-arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            all_targets: true
+            tests: true
+          - name: macos-amd64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            all_targets: true
+            tests: true
+          - name: macos-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            all_targets: true
+            tests: true
+
+          # no-std: ベアメタル (README の no_std チェックと同じ x86_64-unknown-none)。
+          # examples / tests は std 前提でビルドできないため、ライブラリ単体のみを
+          # clippy / build する (nextest は実行不可)。
+          - name: no-std
+            runner: ubuntu-24.04
+            target: x86_64-unknown-none
+            all_targets: false
+            tests: false
+
+          # wasm: ブラウザ向けの標準ターゲット。コンパイルチェックのみ
+          # (wasm32-unknown-unknown のテストバイナリは実行できない)。
+          - name: wasm-unknown
+            runner: ubuntu-24.04
+            target: wasm32-unknown-unknown
+            all_targets: true
+            tests: false
+
+          # wasm: WASI ターゲット。テストバイナリは wasmtime で実行する。
+          - name: wasm-wasi
+            runner: ubuntu-24.04
+            target: wasm32-wasip1
+            all_targets: true
+            tests: true
+
+    env:
+      # wasm32-wasip1 のテストバイナリの実行に wasmtime を使う。
+      CARGO_TARGET_WASM32_WASIP1_RUNNER: wasmtime
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Install wasmtime
+        if: matrix.target == 'wasm32-wasip1'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasmtime
+
+      - name: cargo clippy --all-targets
+        if: matrix.all_targets
+        run: cargo clippy --all-targets --target ${{ matrix.target }}
+
+      - name: cargo clippy --all-targets --no-default-features
+        if: matrix.all_targets
+        run: cargo clippy --all-targets --no-default-features --target ${{ matrix.target }}
+
+      # no-std: examples / tests がビルドできないためライブラリのみ。
+      - name: cargo clippy
+        if: ${{ !matrix.all_targets }}
+        run: cargo clippy --target ${{ matrix.target }}
+
+      - name: cargo clippy --no-default-features
+        if: ${{ !matrix.all_targets }}
+        run: cargo clippy --no-default-features --target ${{ matrix.target }}
+
+      - name: cargo nextest run
+        if: matrix.tests
+        run: cargo nextest run --target ${{ matrix.target }}
+
+      - name: cargo build
+        run: cargo build --target ${{ matrix.target }}
+
+      - name: cargo build --release
+        run: cargo build --release --target ${{ matrix.target }}
