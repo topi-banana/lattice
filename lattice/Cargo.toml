@@ -1,0 +1,14 @@
+[package]
+name = "lattice"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A no_std, capability-based voxel simulation library: block definitions are Rust types composed from facets."
+license = "MIT OR Apache-2.0"
+keywords = ["voxel", "simulation", "no-std", "minecraft", "capabilities"]
+categories = ["game-engines", "no-std", "simulation"]
+
+# 依存はワークスペースルートの [workspace.dependencies] に定義し、
+# ここでは `<name>.workspace = true` の形で参照する。
+# lattice は `core` + `alloc` のみを使うため、現在の外部依存は無い。
+[dependencies]
