@@ -1,0 +1,11 @@
+[package]
+name = "lattice"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A no_std, capability-based voxel simulation library: block definitions are Rust types composed from facets."
+license = "MIT OR Apache-2.0"
+keywords = ["voxel", "simulation", "no-std", "minecraft", "capabilities"]
+categories = ["game-engines", "no-std", "simulation"]
+
+[dependencies]
