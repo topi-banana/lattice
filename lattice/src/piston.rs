@@ -11,8 +11,10 @@
 //!    step.
 //! 4. Losing power cancels a running extension or resets an extended piston.
 //!
-//! There is no block entity in this library yet, so the move is applied in a
-//! single step when the timer expires instead of animating a moving block.
+//! The move is applied in a single step when the timer expires, and block
+//! entities stored in moved cells travel with them (`move_cell`); a
+//! destination that already holds one blocks the stroke. Animating the move
+//! through a moving-block entity is not implemented.
 
 use crate::caps::{CapSet, Power, UnMovable};
 use crate::def::StateCodec;
@@ -185,8 +187,7 @@ crate::block! {
     /// line of movable blocks in front of it one step.
     ///
     /// The piston itself is [`UnMovable`](trait@UnMovable). It does not pull on retraction
-    /// (there is no moving block entity yet); losing power simply resets its
-    /// state.
+    /// yet; losing power simply resets its state.
     pub struct PistonBlock;
     facets: UnMovable;
     state: PistonState;

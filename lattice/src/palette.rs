@@ -6,8 +6,11 @@ use core::fmt;
 use core::hash::{Hash, Hasher};
 use core::ops::Index;
 
+use alloc::boxed::Box;
+
 use crate::caps::CapSet;
 use crate::def::{BlockDef, Identity, default_break_ticks};
+use crate::entity::BlockEntity;
 use crate::pos::Dir;
 use crate::world::TickCtx;
 
@@ -17,9 +20,14 @@ pub(crate) type TickFn = fn(&mut TickCtx<'_>);
 pub(crate) type NeighborFn = fn(&mut TickCtx<'_>, Dir);
 /// Mining duration query.
 pub(crate) type BreakTicksFn = fn(CapSet) -> u32;
+/// Block entity factory.
+pub(crate) type CreateEntityFn = fn() -> Option<Box<dyn BlockEntity>>;
 
 fn noop_tick(_ctx: &mut TickCtx<'_>) {}
 fn noop_neighbor(_ctx: &mut TickCtx<'_>, _from: Dir) {}
+fn no_block_entity() -> Option<Box<dyn BlockEntity>> {
+    None
+}
 
 fn nominal_break_ticks<T: BlockDef>(_caps: CapSet) -> u32 {
     T::break_ticks()
@@ -35,6 +43,7 @@ pub(crate) struct Entry {
     pub(crate) on_neighbor_changed: NeighborFn,
     pub(crate) on_break: TickFn,
     pub(crate) break_ticks: BreakTicksFn,
+    pub(crate) create_block_entity: CreateEntityFn,
 }
 
 impl Entry {
@@ -47,6 +56,7 @@ impl Entry {
             on_neighbor_changed: noop_neighbor,
             on_break: noop_tick,
             break_ticks: default_break_ticks,
+            create_block_entity: no_block_entity,
         }
     }
 }
@@ -77,6 +87,7 @@ impl BlockSource {
             on_neighbor_changed: <T as BlockDef>::on_neighbor_changed,
             on_break: <T as BlockDef>::on_break,
             break_ticks: nominal_break_ticks::<T>,
+            create_block_entity: <T as BlockDef>::create_block_entity,
         })
     }
 
@@ -101,6 +112,7 @@ impl From<CapSet> for BlockSource {
             on_neighbor_changed: noop_neighbor,
             on_break: noop_tick,
             break_ticks: default_break_ticks,
+            create_block_entity: no_block_entity,
         })
     }
 }

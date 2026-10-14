@@ -24,7 +24,7 @@
 //!
 //! ```text
 //! World<H, P>   BTreeMap<ChunkPos, Chunk<H>>   chunks allocated on first write
-//!   Chunk<H>    [SubChunk; H]
+//!   Chunk<H>    [SubChunk; H] + BTreeMap<Pos, Box<dyn BlockEntity>>
 //!     SubChunk  [[[Cell; 16]; 16]; 16] + [u64; 64] schedule bitset
 //! ```
 //!
@@ -98,6 +98,57 @@
 //! assert!(palette.find_type::<Slime>().is_some());
 //! ```
 //!
+//! ## Block entities
+//!
+//! A cell stores at most 16 bits of state. Definitions that need more attach
+//! a [`BlockEntity`] to the position: a heap value stored in a per-chunk map
+//! that is *separate* from the cells. Block states and block entities can be
+//! queried independently, so a position may hold a block with no entity, a
+//! block and an entity, or only an entity ("orphan").
+//!
+//! `entity: E;` in the [`block!`] macro declares that placing the definition
+//! creates `E::default()`; [`World::set_block_entity`] attaches an entity
+//! explicitly. [`World::tick`] runs the block hook first and the entity hook
+//! second for every scheduled position.
+//!
+//! ```
+//! use lattice::{BlockDef, BlockEntity, Empty, EntityTickCtx, Pos, UnMovable, World, block, palette};
+//!
+//! /// A counter that would not fit into the 16-bit cell state.
+//! #[derive(Default)]
+//! pub struct Counter {
+//!     /// Number of scheduled ticks seen.
+//!     pub ticks: u32,
+//! }
+//!
+//! impl BlockEntity for Counter {
+//!     fn on_scheduled_tick(&mut self, ctx: &mut EntityTickCtx<'_>) {
+//!         self.ticks += 1;
+//!         ctx.schedule_self();
+//!     }
+//! }
+//!
+//! block! {
+//!     /// Has no room for `u32` in its cell state, so it uses an entity.
+//!     pub struct Ticker;
+//!     facets: UnMovable;
+//!     entity: Counter;
+//! }
+//!
+//! let palette = palette![Ticker::source(), Empty];
+//! let mut world: World<'_, 1, 2> = World::new(&palette);
+//!
+//! world.set_block(palette.find_type::<Ticker>().unwrap(), (0, 0, 0));
+//! world.schedule((0, 0, 0));
+//! world.tick();
+//! assert_eq!(world.entity::<Counter>((0, 0, 0)).unwrap().ticks, 1);
+//!
+//! // Entity-only positions are fine: the stores are independent.
+//! world.set_block_entity((5, 0, 0), Box::new(Counter::default()));
+//! assert!(world.get(Pos::new(5, 0, 0)).unwrap().empty().is_some());
+//! assert!(world.entity::<Counter>((5, 0, 0)).is_some());
+//! ```
+//!
 //! ## Mechanics
 //!
 //! The [`piston`] module ships a worked mechanism: [`PistonBlock`] observes
@@ -130,15 +181,17 @@
 //! # no_std
 //!
 //! The crate is `#![no_std]` and depends on `core` plus `alloc` (for the
-//! chunk map and the tick scratch buffer). There is no OS dependency and no
-//! `unsafe` code; block and palette definitions themselves need no allocation
-//! at all.
+//! chunk map, the per-chunk block entity map and the tick scratch buffer).
+//! There is no OS dependency and no `unsafe` code; block and palette
+//! definitions themselves need no allocation, and only entities that are
+//! actually attached allocate.
 
 extern crate alloc;
 
 pub mod caps;
 pub mod chunk;
 pub mod def;
+pub mod entity;
 pub mod palette;
 pub mod piston;
 pub mod pos;
@@ -150,6 +203,7 @@ pub use caps::{
 };
 pub use chunk::{Chunk, ChunkPos, SUBCHUNK_SIZE, SUBCHUNK_VOLUME, SubChunk};
 pub use def::{BlockDef, Identity, StateCodec, default_break_ticks};
+pub use entity::{AsAny, BlockEntity, EntityTickCtx};
 pub use palette::{Block, BlockPalette, BlockSource, Facet, PaletteError};
 pub use piston::{
     Facing, PISTON_EXTEND_TICKS, PISTON_PUSH_LIMIT, PistonBlock, PistonPhase, PistonState,
@@ -166,13 +220,17 @@ pub use world::{BreakOutcome, Positions, TickCtx, World};
 /// definition cannot drift apart. Facet names resolve in the calling scope,
 /// which means user-defined facets work exactly like the built-in ones.
 ///
-/// Optional `state:` sets [`BlockDef::State`] (default `()`), and an optional
-/// `behavior { ... }` block may override any [`BlockDef`] method.
+/// Optional `state:` sets [`BlockDef::State`] (default `()`). Optional
+/// `entity: E;` declares a block entity type: the world creates
+/// `E::default()` via [`BlockDef::create_block_entity`] whenever it places
+/// the definition. An optional `behavior { ... }` block may override any
+/// [`BlockDef`] method (do not combine it with `entity:` to override
+/// `create_block_entity` itself).
 ///
 /// # Examples
 ///
 /// ```
-/// use lattice::{block, BlockDef, Empty, Movable, Sticky, TickCtx};
+/// use lattice::{block, BlockDef, BlockEntity, Empty, Movable, Sticky, TickCtx};
 ///
 /// block! {
 ///     /// Sticky and movable.
@@ -180,11 +238,20 @@ pub use world::{BreakOutcome, Positions, TickCtx, World};
 ///     facets: Sticky, Movable;
 /// }
 ///
+/// #[derive(Default)]
+/// pub struct FuseEntity {
+///     /// Previous tick, for illustration.
+///     pub last: u8,
+/// }
+///
+/// impl BlockEntity for FuseEntity {}
+///
 /// block! {
 ///     /// Counts down and removes itself.
 ///     pub struct Fuse;
 ///     facets: lattice::Breakable;
 ///     state: u8;
+///     entity: FuseEntity;
 ///     behavior {
 ///         fn on_scheduled_tick(ctx: &mut TickCtx<'_>) {
 ///             let timer = ctx.state::<Self>();
@@ -207,6 +274,7 @@ macro_rules! block {
         $vis:vis struct $name:ident;
         facets: $($facet:path),+ $(,)? ;
         $(state: $state:ty;)?
+        $(entity: $entity:ty;)?
         $(behavior { $($body:tt)* })?
     ) => {
         $(#[$meta])*
@@ -218,6 +286,16 @@ macro_rules! block {
                 $crate::CapSet::NONE$(.or(<$name as $facet>::CAP))*;
             type State = $crate::block!(@state $($state)?);
 
+            $(
+                fn create_block_entity() -> ::core::option::Option<
+                    $crate::__private::Box<dyn $crate::BlockEntity>,
+                > {
+                    ::core::option::Option::Some($crate::__private::Box::new(
+                        <$entity as ::core::default::Default>::default(),
+                    ))
+                }
+            )?
+
             $($($body)*)?
         }
 
@@ -228,6 +306,12 @@ macro_rules! block {
 
     (@state) => { () };
     (@state $state:ty) => { $state };
+}
+
+/// Implementation details used by the exported macros. Not a public API.
+#[doc(hidden)]
+pub mod __private {
+    pub use alloc::boxed::Box;
 }
 
 /// Builds a [`BlockPalette`] from mixed definition sources.
@@ -265,10 +349,11 @@ macro_rules! palette {
 /// ```
 pub mod prelude {
     pub use crate::{
-        Block, BlockDef, BlockPalette, BlockSource, BreakOutcome, CapSet, Chunk, ChunkPos, Dir,
-        Facet, Facing, Identity, PISTON_EXTEND_TICKS, PISTON_PUSH_LIMIT, PaletteError, PistonBlock,
-        PistonPhase, PistonState, Pos, PowerBlock, Rng32, SUBCHUNK_SIZE, SUBCHUNK_VOLUME,
-        StateCodec, SubChunk, TickCtx, World, block, palette,
+        Block, BlockDef, BlockEntity, BlockPalette, BlockSource, BreakOutcome, CapSet, Chunk,
+        ChunkPos, Dir, EntityTickCtx, Facet, Facing, Identity, PISTON_EXTEND_TICKS,
+        PISTON_PUSH_LIMIT, PaletteError, PistonBlock, PistonPhase, PistonState, Pos, PowerBlock,
+        Rng32, SUBCHUNK_SIZE, SUBCHUNK_VOLUME, StateCodec, SubChunk, TickCtx, World, block,
+        palette,
     };
     pub use crate::{
         Breakable, Empty, Flammable, InstantMinable, Movable, Power, Sticky, UnMovable,

@@ -10,6 +10,7 @@
 use core::any::TypeId;
 use core::fmt;
 
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, btree_map};
 use alloc::vec::Vec;
 
@@ -18,6 +19,7 @@ use crate::chunk::{
     Cell, Chunk, ChunkPos, SCHEDULE_WORDS, SUBCHUNK_SIZE, SUBCHUNK_VOLUME, local_index,
 };
 use crate::def::{BlockDef, Identity, StateCodec};
+use crate::entity::{BlockEntity, EntityTickCtx};
 use crate::palette::{Block, BlockPalette, PaletteError};
 use crate::pos::{Dir, Pos};
 use crate::rng::Rng32;
@@ -38,7 +40,7 @@ pub enum BreakOutcome {
     OutOfBounds,
 }
 
-/// The subset of world operations visible to block hooks.
+/// The subset of world operations visible to block and block entity hooks.
 pub(crate) trait WorldAccess {
     fn get_block(&self, pos: Pos) -> Option<Block>;
     fn set_block(&mut self, block: &Block, pos: Pos) -> Option<Block>;
@@ -49,6 +51,10 @@ pub(crate) trait WorldAccess {
     fn remove_block(&mut self, pos: Pos) -> Option<Block>;
     fn move_cell(&mut self, from: Pos, to: Pos) -> bool;
     fn notify(&mut self, pos: Pos);
+    fn block_entity(&self, pos: Pos) -> Option<&dyn BlockEntity>;
+    fn block_entity_mut(&mut self, pos: Pos) -> Option<&mut dyn BlockEntity>;
+    fn set_block_entity(&mut self, pos: Pos, entity: Option<Box<dyn BlockEntity>>) -> bool;
+    fn remove_block_entity(&mut self, pos: Pos) -> Option<Box<dyn BlockEntity>>;
 }
 
 /// The context passed to every [`BlockDef`] hook.
@@ -148,6 +154,52 @@ impl<'w> TickCtx<'w> {
         self.set_state_raw(state.encode());
     }
 
+    /// Reads the block entity at `pos`.
+    ///
+    /// Block states and block entities are stored separately, so this can
+    /// return `Some` while [`TickCtx::get`] reports air (and vice versa). See
+    /// the [`entity`](crate::entity) module.
+    pub fn block_entity(&self, pos: impl Into<Pos>) -> Option<&dyn BlockEntity> {
+        self.world.block_entity(pos.into())
+    }
+
+    /// Mutable access to the block entity at `pos`.
+    pub fn block_entity_mut(&mut self, pos: impl Into<Pos>) -> Option<&mut dyn BlockEntity> {
+        self.world.block_entity_mut(pos.into())
+    }
+
+    /// Reads the block entity at `pos`, downcast to `T`.
+    pub fn entity<T: BlockEntity>(&self, pos: impl Into<Pos>) -> Option<&T> {
+        self.block_entity(pos)?.downcast_ref::<T>()
+    }
+
+    /// Mutable downcast of the block entity at `pos`.
+    pub fn entity_mut<T: BlockEntity>(&mut self, pos: impl Into<Pos>) -> Option<&mut T> {
+        self.block_entity_mut(pos)?.downcast_mut::<T>()
+    }
+
+    /// Stores (`Some`) or removes (`None`) the block entity at `pos`,
+    /// loading the chunk when necessary.
+    ///
+    /// Returns `false` when `pos` is outside the vertical range, or when
+    /// `None` was requested for an unloaded chunk. The block at `pos` is not
+    /// touched, so this can create or drop an entity independently of the
+    /// cell.
+    pub fn set_block_entity(
+        &mut self,
+        pos: impl Into<Pos>,
+        entity: Option<Box<dyn BlockEntity>>,
+    ) -> bool {
+        self.world.set_block_entity(pos.into(), entity)
+    }
+
+    /// Removes and returns the block entity at `pos`.
+    ///
+    /// The block at `pos` is not touched.
+    pub fn remove_block_entity(&mut self, pos: impl Into<Pos>) -> Option<Box<dyn BlockEntity>> {
+        self.world.remove_block_entity(pos.into())
+    }
+
     /// Schedules `pos` for the next [`World::tick`].
     ///
     /// Returns `false` when `pos` is outside the vertical range or its chunk
@@ -211,6 +263,10 @@ impl fmt::Debug for TickCtx<'_> {
 /// `H` is the number of 16³ sub-chunks stacked vertically (`H = 4` is 64
 /// blocks high) and `P` is the palette capacity. Horizontally the world is
 /// unbounded: chunks are created when a block is first written into them.
+///
+/// Each chunk also owns a sparse map of [`BlockEntity`] values keyed by
+/// position, stored separately from the cells. See the
+/// [`entity`](crate::entity) module for the lifecycle and the tick rules.
 ///
 /// ```
 /// use lattice::{BlockPalette, Empty, Movable, Pos, Sticky, World};
@@ -316,7 +372,7 @@ impl<'a, const H: usize, const P: usize> World<'a, H, P> {
         true
     }
 
-    /// Removes a chunk and returns its data.
+    /// Removes a chunk and returns its data, block entities included.
     ///
     /// Scheduled positions inside it are dropped.
     pub fn unload_chunk(&mut self, pos: ChunkPos) -> Option<Chunk<H>> {
@@ -377,8 +433,12 @@ impl<'a, const H: usize, const P: usize> World<'a, H, P> {
             },
         );
         if previous.identity() != block.identity() {
-            self.notify_neighbors(pos);
+            // Replacing a block replaces its block entity: drop the old one,
+            // then run the new definition's factory, if it has one.
             let entry = *self.palette.entry(block_index as usize);
+            let created = (entry.create_block_entity)();
+            self.set_block_entity_raw(pos, created);
+            self.notify_neighbors(pos);
             let mut ctx = TickCtx::new(self, pos, block);
             (entry.on_placed)(&mut ctx);
         }
@@ -388,8 +448,10 @@ impl<'a, const H: usize, const P: usize> World<'a, H, P> {
     /// Removes the block at `pos`, replacing it with air.
     ///
     /// Unlike [`World::break_block`] this ignores capabilities and does not
-    /// run [`BlockDef::on_break`]. Returns `None` when the chunk is not
-    /// loaded or `pos` is outside the vertical range.
+    /// run [`BlockDef::on_break`]. The block entity at `pos` is removed with
+    /// the block; removing a cell that was already air leaves orphan
+    /// entities in place. Returns `None` when the chunk is not loaded or
+    /// `pos` is outside the vertical range.
     pub fn remove_block(&mut self, pos: Pos) -> Option<Block> {
         let (chunk_pos, x, y, z) = self.split(pos)?;
         let chunk = self.chunks.get_mut(&chunk_pos)?;
@@ -405,6 +467,7 @@ impl<'a, const H: usize, const P: usize> World<'a, H, P> {
             },
         );
         if !previous.caps().contains(CapSet::EMPTY) {
+            self.remove_block_entity_raw(pos);
             self.notify_neighbors(pos);
         }
         Some(previous)
@@ -444,6 +507,112 @@ impl<'a, const H: usize, const P: usize> World<'a, H, P> {
     /// vertical range.
     pub fn set_state<T: BlockDef>(&mut self, pos: impl Into<Pos>, state: T::State) -> bool {
         self.set_state_raw(pos, state.encode())
+    }
+
+    /// Reads the block entity at `pos`.
+    ///
+    /// Returns `None` when the position holds no entity or its chunk is not
+    /// loaded. The block and the entity are stored separately, so this is
+    /// independent from [`World::get`]: an entity can exist where the block
+    /// is air, and a block can exist without one. See the
+    /// [`entity`](crate::entity) module for the lifecycle.
+    pub fn block_entity(&self, pos: impl Into<Pos>) -> Option<&dyn BlockEntity> {
+        let pos = pos.into();
+        let (chunk_pos, ..) = self.split(pos)?;
+        self.chunks.get(&chunk_pos)?.block_entity(pos)
+    }
+
+    /// Mutable access to the block entity at `pos`.
+    pub fn block_entity_mut(&mut self, pos: impl Into<Pos>) -> Option<&mut dyn BlockEntity> {
+        let pos = pos.into();
+        let (chunk_pos, ..) = self.split(pos)?;
+        self.chunks.get_mut(&chunk_pos)?.block_entity_mut(pos)
+    }
+
+    /// Reads the block entity at `pos`, downcast to `T`.
+    ///
+    /// ```
+    /// use lattice::{BlockDef, BlockEntity, Empty, EntityTickCtx, UnMovable, World, block, palette};
+    ///
+    /// #[derive(Default)]
+    /// pub struct Counter {
+    ///     /// Number of ticks seen so far.
+    ///     pub ticks: u32,
+    /// }
+    ///
+    /// impl BlockEntity for Counter {
+    ///     fn on_scheduled_tick(&mut self, ctx: &mut EntityTickCtx<'_>) {
+    ///         self.ticks += 1;
+    ///         ctx.schedule_self();
+    ///     }
+    /// }
+    ///
+    /// block! {
+    ///     pub struct Ticker;
+    ///     facets: UnMovable;
+    ///     entity: Counter;
+    /// }
+    ///
+    /// let palette = palette![Ticker::source(), Empty];
+    /// let mut world: World<'_, 1, 2> = World::new(&palette);
+    ///
+    /// world.set_block(palette.find_type::<Ticker>().unwrap(), (0, 0, 0));
+    /// world.schedule((0, 0, 0));
+    /// world.tick();
+    /// assert_eq!(world.entity::<Counter>((0, 0, 0)).unwrap().ticks, 1);
+    /// ```
+    pub fn entity<T: BlockEntity>(&self, pos: impl Into<Pos>) -> Option<&T> {
+        self.block_entity(pos)?.downcast_ref::<T>()
+    }
+
+    /// Mutable downcast of the block entity at `pos`.
+    pub fn entity_mut<T: BlockEntity>(&mut self, pos: impl Into<Pos>) -> Option<&mut T> {
+        self.block_entity_mut(pos)?.downcast_mut::<T>()
+    }
+
+    /// Stores a block entity at `pos`, loading the chunk when necessary and
+    /// returning the previous entity, if any.
+    ///
+    /// The block at `pos` is not touched: this can create an entity where the
+    /// block is air, or attach one to a definition that declares no factory.
+    /// Returns `None` when `pos` is outside the vertical range, or when there
+    /// was no previous entity.
+    pub fn set_block_entity(
+        &mut self,
+        pos: impl Into<Pos>,
+        entity: Box<dyn BlockEntity>,
+    ) -> Option<Box<dyn BlockEntity>> {
+        let pos = pos.into();
+        let (chunk_pos, ..) = self.split(pos)?;
+        let empty_index = self.empty.index;
+        let chunk = self.chunks.entry(chunk_pos).or_insert_with(|| {
+            Chunk::filled(Cell {
+                block: empty_index,
+                state: 0,
+            })
+        });
+        chunk.insert_block_entity(pos, entity)
+    }
+
+    /// Removes and returns the block entity at `pos`.
+    ///
+    /// The block at `pos` is not touched. Returns `None` when the position
+    /// holds no entity or its chunk is not loaded.
+    pub fn remove_block_entity(&mut self, pos: impl Into<Pos>) -> Option<Box<dyn BlockEntity>> {
+        self.remove_block_entity_raw(pos.into())
+    }
+
+    /// Number of block entities across all loaded chunks.
+    pub fn block_entity_count(&self) -> usize {
+        self.chunks.values().map(Chunk::block_entity_count).sum()
+    }
+
+    /// Iterates over `(pos, entity)` of every loaded chunk, chunks in
+    /// coordinate order and positions in map order.
+    pub fn block_entities(&self) -> impl Iterator<Item = (Pos, &dyn BlockEntity)> + '_ {
+        self.chunks
+            .values()
+            .flat_map(|chunk| chunk.block_entities())
     }
 
     /// Schedules `pos` for the next [`World::tick`].
@@ -497,6 +666,12 @@ impl<'a, const H: usize, const P: usize> World<'a, H, P> {
     /// hook run are executed on the *next* call to `tick`, never twice in the
     /// same pass. Chunks loaded while ticking are visited on the next pass.
     ///
+    /// A scheduled position wakes both facets of the cell: the block's
+    /// [`on_scheduled_tick`](BlockDef::on_scheduled_tick) runs first, then
+    /// the block entity's [`on_scheduled_tick`](BlockEntity::on_scheduled_tick)
+    /// if one is stored there. A position holding only an orphan entity still
+    /// ticks its entity.
+    ///
     /// Returns the number of executed scheduled ticks.
     pub fn tick(&mut self) -> usize {
         let mut processed = 0usize;
@@ -543,6 +718,7 @@ impl<'a, const H: usize, const P: usize> World<'a, H, P> {
                         let handler = self.palette.entry(block.index()).on_scheduled_tick;
                         let mut ctx = TickCtx::new(self, pos, block);
                         handler(&mut ctx);
+                        self.tick_block_entity(pos, true);
                         processed += 1;
                     }
                 }
@@ -556,8 +732,10 @@ impl<'a, const H: usize, const P: usize> World<'a, H, P> {
     /// Runs `count` random ticks and returns how many cells were visited.
     ///
     /// Each tick picks a loaded chunk (uniformly) and a cell inside it
-    /// (uniformly), then calls [`BlockDef::on_random_tick`]. Unloaded chunks
-    /// are never picked and an empty world visits nothing.
+    /// (uniformly), then calls [`BlockDef::on_random_tick`] followed by the
+    /// block entity's [`on_random_tick`](BlockEntity::on_random_tick) when
+    /// the cell holds one. Unloaded chunks are never picked and an empty
+    /// world visits nothing.
     pub fn random_tick(&mut self, rng: &mut Rng32, count: usize) -> usize {
         let total = self.chunks.len();
         if total == 0 {
@@ -584,6 +762,7 @@ impl<'a, const H: usize, const P: usize> World<'a, H, P> {
             let handler = self.palette.entry(block.index()).on_random_tick;
             let mut ctx = TickCtx::new(self, pos, block);
             handler(&mut ctx);
+            self.tick_block_entity(pos, false);
             processed += 1;
         }
         processed
@@ -592,7 +771,9 @@ impl<'a, const H: usize, const P: usize> World<'a, H, P> {
     /// Mines the block at `pos` according to its capabilities.
     ///
     /// * [`InstantMinable`](trait@crate::InstantMinable) blocks are removed
-    ///   and their [`on_break`](BlockDef::on_break) hook runs.
+    ///   and their [`on_break`](BlockDef::on_break) hook runs. The block
+    ///   entity at `pos` is removed once the hook returns, so the hook still
+    ///   sees it.
     /// * [`Breakable`](trait@crate::Breakable) blocks report
     ///   [`BreakOutcome::NeedsTicks`] with [`BlockDef::break_ticks`].
     /// * Anything else reports [`BreakOutcome::Unbreakable`].
@@ -612,8 +793,11 @@ impl<'a, const H: usize, const P: usize> World<'a, H, P> {
             let empty_index = self.empty.index;
             self.write_cell(pos, empty_index, 0);
             self.notify_neighbors(pos);
+            // The hook still sees the block entity; it is removed afterwards,
+            // together with the block.
             let mut ctx = TickCtx::new(self, pos, block);
             (entry.on_break)(&mut ctx);
+            self.remove_block_entity_raw(pos);
             return BreakOutcome::Broken;
         }
         if caps.contains(CapSet::BREAKABLE) {
@@ -676,18 +860,101 @@ impl<'a, const H: usize, const P: usize> World<'a, H, P> {
         }
     }
 
-    /// Moves one cell to `to`, preserving its raw state; returns `false`
-    /// when either cell is missing.
+    /// Reads a block entity from a loaded chunk without loading anything.
+    fn block_entity_raw(&self, pos: Pos) -> Option<&dyn BlockEntity> {
+        let (chunk_pos, ..) = self.split(pos)?;
+        self.chunks.get(&chunk_pos)?.block_entity(pos)
+    }
+
+    /// Removes a block entity from a loaded chunk without loading anything.
+    fn remove_block_entity_raw(&mut self, pos: Pos) -> Option<Box<dyn BlockEntity>> {
+        let (chunk_pos, ..) = self.split(pos)?;
+        self.chunks.get_mut(&chunk_pos)?.take_block_entity(&pos)
+    }
+
+    /// Stores or removes (`None`) a block entity in a loaded chunk, without
+    /// loading anything, and returns the previous entity.
+    fn set_block_entity_raw(
+        &mut self,
+        pos: Pos,
+        entity: Option<Box<dyn BlockEntity>>,
+    ) -> Option<Box<dyn BlockEntity>> {
+        let (chunk_pos, ..) = self.split(pos)?;
+        let chunk = self.chunks.get_mut(&chunk_pos)?;
+        match entity {
+            Some(entity) => chunk.insert_block_entity(pos, entity),
+            None => chunk.take_block_entity(&pos),
+        }
+    }
+
+    /// Runs one block entity hook for `pos`, if an entity is stored there.
+    ///
+    /// The entity is detached from the world while the hook runs, so the
+    /// hook can own `&mut self` while [`EntityTickCtx`] borrows the world.
+    /// It is re-attached afterwards unless the hook requested removal
+    /// ([`EntityTickCtx::remove_self`]), installed a replacement entity, or
+    /// changed the identity of the block at `pos` (replacing or removing a
+    /// block takes its entity with it).
+    ///
+    /// `scheduled` selects [`BlockEntity::on_scheduled_tick`] over
+    /// [`BlockEntity::on_random_tick`]. Returns `true` when a hook ran.
+    fn tick_block_entity(&mut self, pos: Pos, scheduled: bool) -> bool {
+        let Some(mut entity) = self.remove_block_entity_raw(pos) else {
+            return false;
+        };
+        let before = self.get(pos).map(|block| block.identity());
+        let removal_requested = {
+            let mut ctx = EntityTickCtx::new(self, pos);
+            if scheduled {
+                entity.on_scheduled_tick(&mut ctx);
+            } else {
+                entity.on_random_tick(&mut ctx);
+            }
+            ctx.removal_requested()
+        };
+        let survives = !removal_requested
+            && self.block_entity_raw(pos).is_none()
+            && self.get(pos).map(|block| block.identity()) == before;
+        if survives {
+            self.set_block_entity_raw(pos, Some(entity));
+        }
+        true
+    }
+
+    /// Moves one cell to `to`, preserving its raw state and carrying its
+    /// block entity; returns `false` when either cell is missing or when
+    /// both cells hold a block entity (a position stores at most one).
     pub(crate) fn move_cell(&mut self, from: Pos, to: Pos) -> bool {
         let Some(cell) = self.cell_at(from) else {
             return false;
         };
+        if from == to {
+            return true;
+        }
         if self.split(to).is_none() || !self.chunks.contains_key(&ChunkPos::of(to)) {
+            return false;
+        }
+        let from_chunk = ChunkPos::of(from);
+        let entity = self
+            .chunks
+            .get_mut(&from_chunk)
+            .and_then(|chunk| chunk.take_block_entity(&from));
+        if entity.is_some() && self.block_entity_raw(to).is_some() {
+            // Put the entity back; the move is rejected instead of
+            // overwriting the destination entity.
+            if let Some(entity) = entity
+                && let Some(chunk) = self.chunks.get_mut(&from_chunk)
+            {
+                chunk.insert_block_entity(from, entity);
+            }
             return false;
         }
         let empty_index = self.empty.index;
         self.write_cell(to, cell.block, cell.state);
         self.write_cell(from, empty_index, 0);
+        if let Some(entity) = entity {
+            self.set_block_entity_raw(to, Some(entity));
+        }
         true
     }
 
@@ -740,6 +1007,39 @@ impl<'a, const H: usize, const P: usize> WorldAccess for World<'a, H, P> {
     fn notify(&mut self, pos: Pos) {
         World::notify_neighbors(self, pos)
     }
+
+    fn block_entity(&self, pos: Pos) -> Option<&dyn BlockEntity> {
+        World::block_entity(self, pos)
+    }
+
+    fn block_entity_mut(&mut self, pos: Pos) -> Option<&mut dyn BlockEntity> {
+        World::block_entity_mut(self, pos)
+    }
+
+    fn set_block_entity(&mut self, pos: Pos, entity: Option<Box<dyn BlockEntity>>) -> bool {
+        match entity {
+            Some(entity) => {
+                // Same "load on write" rule as `set_block`.
+                World::set_block_entity(self, pos, entity);
+                self.contains(pos)
+            }
+            None => {
+                let Some((chunk_pos, ..)) = self.split(pos) else {
+                    return false;
+                };
+                if let Some(chunk) = self.chunks.get_mut(&chunk_pos) {
+                    chunk.take_block_entity(&pos);
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    fn remove_block_entity(&mut self, pos: Pos) -> Option<Box<dyn BlockEntity>> {
+        World::remove_block_entity(self, pos)
+    }
 }
 
 impl<const H: usize, const P: usize> fmt::Debug for World<'_, H, P> {
@@ -747,6 +1047,7 @@ impl<const H: usize, const P: usize> fmt::Debug for World<'_, H, P> {
         f.debug_struct("World")
             .field("sections", &H)
             .field("chunks", &self.chunks.len())
+            .field("block_entities", &self.block_entity_count())
             .field("palette", &self.palette)
             .finish_non_exhaustive()
     }

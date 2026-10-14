@@ -2,7 +2,10 @@
 
 use core::any::TypeId;
 
+use alloc::boxed::Box;
+
 use crate::caps::CapSet;
+use crate::entity::BlockEntity;
 use crate::palette::BlockSource;
 use crate::pos::Dir;
 use crate::world::TickCtx;
@@ -217,6 +220,46 @@ pub trait BlockDef: 'static {
     /// Runs after this block was broken (removed) by
     /// [`World::break_block`](crate::World::break_block).
     fn on_break(_ctx: &mut TickCtx<'_>) {}
+
+    /// Creates the block entity that belongs to this definition.
+    ///
+    /// The world calls this whenever it places the definition where a
+    /// different definition (or air) was before, and stores the result at
+    /// the position. Any previous entity is dropped first: replacing a block
+    /// replaces its entity, while a state-only update leaves it untouched.
+    ///
+    /// The default implements the "no block entity" case. [`block!`](crate::block)
+    /// generates the method from the optional `entity: E;` clause, using
+    /// `E::default()`; definitions that need arguments can write the method
+    /// by hand.
+    ///
+    /// ```
+    /// use lattice::{BlockDef, BlockEntity, Empty, UnMovable, World, block, palette};
+    ///
+    /// #[derive(Default)]
+    /// pub struct Counter {
+    ///     /// Number of ticks seen so far.
+    ///     pub ticks: u32,
+    /// }
+    ///
+    /// impl BlockEntity for Counter {}
+    ///
+    /// block! {
+    ///     /// A block that stores a `u32` in a block entity.
+    ///     pub struct Ticker;
+    ///     facets: UnMovable;
+    ///     entity: Counter;
+    /// }
+    ///
+    /// let palette = palette![Ticker::source(), Empty];
+    /// let mut world: World<'_, 1, 2> = World::new(&palette);
+    ///
+    /// world.set_block(palette.find_type::<Ticker>().unwrap(), (0, 0, 0));
+    /// assert_eq!(world.entity::<Counter>((0, 0, 0)).unwrap().ticks, 0);
+    /// ```
+    fn create_block_entity() -> Option<Box<dyn BlockEntity>> {
+        None
+    }
 
     /// How many ticks [`World::break_block`](crate::World::break_block)
     /// reports for a breakable block. Defaults to the capability-based

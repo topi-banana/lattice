@@ -4,10 +4,15 @@
 //!
 //! ```text
 //! World<H, P>   BTreeMap<ChunkPos, Chunk<H>>
-//!   Chunk<H>    [SubChunk; H]
+//!   Chunk<H>    [SubChunk; H] + BTreeMap<Pos, Box<dyn BlockEntity>>
 //!     SubChunk  [[[Cell; 16]; 16]; 16] + [u64; 64] schedule bitset
 //!       Cell    block index + u16 state
 //! ```
+//!
+//! Block entities are stored in a chunk-level map keyed by [`Pos`], separate
+//! from the cells, so a position can hold an entity independently of the
+//! block state (see the [`entity`](crate::entity) module). They follow the
+//! chunk: unloading a chunk yields its entities with it.
 //!
 //! A [`ChunkPos`] addresses a horizontal column; the vertical position is the
 //! sub-chunk index inside [`Chunk<H>`]. Block coordinates map with floor
@@ -16,6 +21,10 @@
 
 use core::fmt;
 
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+
+use crate::entity::BlockEntity;
 use crate::pos::Pos;
 
 /// Edge length of a sub-chunk along every axis.
@@ -194,12 +203,15 @@ impl fmt::Debug for SubChunk {
     }
 }
 
-/// A vertical stack of `H` sub-chunks.
+/// A vertical stack of `H` sub-chunks plus their block entities.
 ///
 /// Chunks are the unit of loading: a [`World`](crate::World) allocates one
-/// when a block is first written into it.
+/// when a block is first written into it. Block entities live in their own
+/// map keyed by [`Pos`], isolated from the cells (see the
+/// [`entity`](crate::entity) module), and travel with the chunk.
 pub struct Chunk<const H: usize> {
     subchunks: [SubChunk; H],
+    entities: BTreeMap<Pos, Box<dyn BlockEntity>>,
 }
 
 impl<const H: usize> Chunk<H> {
@@ -209,6 +221,7 @@ impl<const H: usize> Chunk<H> {
     pub(crate) fn filled(cell: Cell) -> Self {
         Self {
             subchunks: core::array::from_fn(|_| SubChunk::filled(cell)),
+            entities: BTreeMap::new(),
         }
     }
 
@@ -238,6 +251,46 @@ impl<const H: usize> Chunk<H> {
             .iter()
             .map(|section| section.scheduled_count as usize)
             .sum()
+    }
+
+    /// Number of block entities stored in this chunk.
+    pub fn block_entity_count(&self) -> usize {
+        self.entities.len()
+    }
+
+    /// Iterates over the `(position, entity)` pairs of this chunk in
+    /// coordinate order.
+    pub fn block_entities(&self) -> impl Iterator<Item = (Pos, &dyn BlockEntity)> + '_ {
+        self.entities.iter().map(|(&pos, entity)| (pos, &**entity))
+    }
+
+    /// Read-only access to the block entity at `pos`.
+    ///
+    /// This is independent from the cell at the same position: the entity may
+    /// exist while the cell is air, and vice versa.
+    pub fn block_entity(&self, pos: Pos) -> Option<&dyn BlockEntity> {
+        self.entities.get(&pos).map(|entity| &**entity)
+    }
+
+    /// Mutable access to the block entity at `pos`.
+    pub fn block_entity_mut(&mut self, pos: Pos) -> Option<&mut dyn BlockEntity> {
+        self.entities
+            .get_mut(&pos)
+            .map(|entity| &mut **entity as &mut dyn BlockEntity)
+    }
+
+    /// Inserts an entity, returning the previous one.
+    pub(crate) fn insert_block_entity(
+        &mut self,
+        pos: Pos,
+        entity: Box<dyn BlockEntity>,
+    ) -> Option<Box<dyn BlockEntity>> {
+        self.entities.insert(pos, entity)
+    }
+
+    /// Removes and returns the entity at `pos`.
+    pub(crate) fn take_block_entity(&mut self, pos: &Pos) -> Option<Box<dyn BlockEntity>> {
+        self.entities.remove(pos)
     }
 
     pub(crate) fn subchunk(&self, index: usize) -> &SubChunk {
@@ -276,6 +329,7 @@ impl<const H: usize> fmt::Debug for Chunk<H> {
         f.debug_struct("Chunk")
             .field("sections", &H)
             .field("scheduled", &self.scheduled_count())
+            .field("block_entities", &self.entities.len())
             .finish_non_exhaustive()
     }
 }
