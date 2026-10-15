@@ -38,6 +38,7 @@ $ cargo run --example basic             # 最小のパレット + schedule + tic
 $ cargo run --example custom_blocks     # 独自ブロック定義と StateCodec
 $ cargo run --example piston            # ピストン + レッドストーン: 設置 → 6gt → 移動
 $ cargo run --example entities          # block entity: セル外の状態と孤立 entity の tick
+$ cargo run --example all_blocks        # Minecraft 26.2 の全1196ブロックを登録したパレット
 $ cargo test                            # 単体テスト + ドキュメントテスト
 ```
 
@@ -270,6 +271,7 @@ examples/
   custom_blocks.rs    独自定義 + ステート + `T: Sticky + Movable` 境界
   piston.rs           ピストン + レッドストーン: 設置 → 6gt → 移動
   entities.rs         block entity + 孤立 entity の tick
+  all_blocks.rs       Minecraft 26.2 全1196ブロック + StateCodec + ファセット写像
 tests/
   definitions.rs  同一性・境界・能力ビット
   simulation.rs   tick・隣接・破壊・押し出し・チャンクのライフサイクル
@@ -286,3 +288,6 @@ tests/
 - 流体・マルチブロック構造など、より大きなシミュレーション語彙
 - イベント購読（破壊・移動・隣接更新）と観測フック
 - 能力集合に対する型レベル述語（`T::Facets: Contains<Sticky>`）による境界の自動導出
+
+26.2 の全ブロックを対象にした、追加実装が必要な BlockDef の詳細なロードマップは
+[`docs/blockdef-roadmap.md`](../docs/blockdef-roadmap.md) を参照。
